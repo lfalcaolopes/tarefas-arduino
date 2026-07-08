@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+
+# tarefas-fetch - busca tarefas do TickTick e grava em tarefas.txt
+# para serem sincronizadas com o Arduino por `tarefas-arduino`.
+#
+# Uso:
+#   tarefas-fetch auth          autoriza o acesso ao TickTick (uma vez)
+#   tarefas-fetch lists         mostra suas listas (projects) do TickTick
+#   tarefas-fetch use <nome|id> escolhe de qual lista puxar as tarefas
+#   tarefas-fetch use today     modo "Hoje": tarefas vencidas/para hoje de todas as listas
+#   tarefas-fetch [--stdout]    puxa as tarefas da lista/modo escolhido
+#
+# Depois: `tarefas-fetch && tarefas-arduino`
+set -euo pipefail
+
+CONFIG_DIR="$HOME/.config/tarefas-arduino"
+ARQUIVO="$CONFIG_DIR/tarefas.txt"
+ENV_FILE="$CONFIG_DIR/ticktick.env"
+TOKEN_FILE="$CONFIG_DIR/ticktick-token.json"
+
+REDIRECT_URI="http://127.0.0.1:8080/"
+REDIRECT_PORT=8080
+SCOPE="tasks:read tasks:write"
+AUTH_URL="https://ticktick.com/oauth/authorize"
+TOKEN_URL="https://ticktick.com/oauth/token"
+API_BASE="https://api.ticktick.com/open/v1"
+
+MAX_TAREFAS=10
+TAM_TAREFA=16   # trunca titulos pra caber no display do Arduino
+
+VERDE='\033[0;32m'
+AMARELO='\033[0;33m'
+VERMELHO='\033[0;31m'
+RESET='\033[0m'
+
+info()  { echo -e "${VERDE}→${RESET} $*"; }
+aviso() { echo -e "${AMARELO}!${RESET} $*"; }
+erro()  { echo -e "${VERMELHO}✗${RESET} $*" >&2; }
+
+mkdir -p "$CONFIG_DIR"
+
+# ---------------------------------------------------------------------------
+# Credenciais do app (client_id / client_secret registrados em
+# https://developer.ticktick.com/manage). Ficam em $ENV_FILE.
+# ---------------------------------------------------------------------------
+carregar_env() {
+    if [[ -f "$ENV_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$ENV_FILE"
+    fi
+    CLIENT_ID="${TICKTICK_CLIENT_ID:-}"
+    CLIENT_SECRET="${TICKTICK_CLIENT_SECRET:-}"
+    PROJECT_ID="${TICKTICK_PROJECT_ID:-}"
+    PROJECT_NAME="${TICKTICK_PROJECT_NAME:-}"
+}
+
+salvar_env() {
+    umask 077
+    cat > "$ENV_FILE" <<EOF
+# Credenciais do TickTick Open API (nao commite isto)
+TICKTICK_CLIENT_ID="${CLIENT_ID}"
+TICKTICK_CLIENT_SECRET="${CLIENT_SECRET}"
+TICKTICK_PROJECT_ID="${PROJECT_ID}"
+TICKTICK_PROJECT_NAME="${PROJECT_NAME}"
+EOF
+    chmod 600 "$ENV_FILE"
+}
+
+garantir_credenciais() {
+    if [[ -z "$CLIENT_ID" || -z "$CLIENT_SECRET" ]]; then
+        aviso "Credenciais do TickTick ainda nao configuradas."
+        echo "Crie um app em https://developer.ticktick.com/manage"
+        echo "e registre o Redirect URI EXATAMENTE como: $REDIRECT_URI"
+        echo
+        read -rp "Client ID: " CLIENT_ID
+        read -rp "Client Secret: " CLIENT_SECRET
+        [[ -n "$CLIENT_ID" && -n "$CLIENT_SECRET" ]] || { erro "Credenciais vazias."; exit 1; }
+        salvar_env
+        info "Credenciais salvas em $ENV_FILE"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Token de acesso
+# ---------------------------------------------------------------------------
+token_valido() {
+    [[ -f "$TOKEN_FILE" ]] || return 1
+    local expira agora
+    expira=$(jq -r '.expires_at // 0' "$TOKEN_FILE" 2>/dev/null || echo 0)
+    agora=$(date +%s)
+    (( agora < expira ))
+}
+
+ler_token() {
+    jq -r '.access_token // empty' "$TOKEN_FILE" 2>/dev/null
+}
+
+# urlencode via jq (@uri)
+urlencode() { jq -rn --arg s "$1" '$s|@uri'; }
+
+# Sobe um servidor HTTP efemero que captura ?code=... do redirect.
+# Imprime: linha 1 = code, linha 2 = state
+capturar_redirect() {
+    python3 - "$REDIRECT_PORT" <<'PYEOF'
+import http.server, socketserver, urllib.parse, sys
+port = int(sys.argv[1])
+holder = {}
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        holder['code'] = params.get('code', [''])[0]
+        holder['state'] = params.get('state', [''])[0]
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+        self.wfile.write('<html><body style="font-family:sans-serif">'
+                         '<h2>Autorizado. Pode fechar esta aba e voltar ao terminal.</h2>'
+                         '</body></html>'.encode())
+    def log_message(self, *a):
+        pass
+with socketserver.TCPServer(('127.0.0.1', port), H) as httpd:
+    httpd.handle_request()
+print(holder.get('code', ''))
+print(holder.get('state', ''))
+PYEOF
+}
+
+cmd_auth() {
+    carregar_env
+    garantir_credenciais
+
+    local state url
+    state=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    url="${AUTH_URL}?scope=$(urlencode "$SCOPE")&client_id=$(urlencode "$CLIENT_ID")&state=${state}&redirect_uri=$(urlencode "$REDIRECT_URI")&response_type=code"
+
+    info "Abrindo o navegador para autorizar..."
+    echo "Se nao abrir, cole esta URL no navegador:"
+    echo "  $url"
+    echo
+    ( xdg-open "$url" >/dev/null 2>&1 & )
+
+    info "Aguardando o redirect em $REDIRECT_URI ..."
+    local resultado code state_recebido
+    resultado=$(capturar_redirect)
+    code=$(sed -n '1p' <<<"$resultado")
+    state_recebido=$(sed -n '2p' <<<"$resultado")
+
+    [[ -n "$code" ]] || { erro "Nao recebi o code de autorizacao."; exit 1; }
+    if [[ "$state_recebido" != "$state" ]]; then
+        erro "State nao confere (possivel CSRF). Abortando."
+        exit 1
+    fi
+
+    info "Trocando code por access token..."
+    local resp
+    resp=$(curl -sS -u "$CLIENT_ID:$CLIENT_SECRET" \
+        -d "grant_type=authorization_code" \
+        -d "code=$code" \
+        --data-urlencode "scope=$SCOPE" \
+        --data-urlencode "redirect_uri=$REDIRECT_URI" \
+        "$TOKEN_URL")
+
+    local access expires
+    access=$(jq -r '.access_token // empty' <<<"$resp")
+    expires=$(jq -r '.expires_in // 0' <<<"$resp")
+    if [[ -z "$access" ]]; then
+        erro "Falha ao obter token. Resposta:"
+        echo "$resp" >&2
+        exit 1
+    fi
+
+    local expires_at
+    expires_at=$(( $(date +%s) + expires - 60 ))
+    umask 077
+    jq -n --arg t "$access" --argjson e "$expires_at" \
+        '{access_token:$t, expires_at:$e}' > "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+    info "Autorizado. Token valido por ~$(( expires / 86400 )) dias."
+}
+
+garantir_token() {
+    if ! token_valido; then
+        erro "Sem token valido. Rode primeiro: tarefas-fetch auth"
+        exit 1
+    fi
+}
+
+api_get() {
+    local path="$1" tok
+    tok=$(ler_token)
+    curl -sS -H "Authorization: Bearer $tok" "${API_BASE}${path}"
+}
+
+cmd_lists() {
+    carregar_env
+    garantir_token
+    local resp
+    resp=$(api_get "/project")
+    if ! jq -e 'type=="array"' >/dev/null 2>&1 <<<"$resp"; then
+        erro "Resposta inesperada do TickTick:"; echo "$resp" >&2; exit 1
+    fi
+    info "Suas listas (projects):"
+    jq -r '.[] | "  \(.name)\t[\(.id)]"' <<<"$resp"
+    echo
+    echo "Escolha uma com: tarefas-fetch use \"<nome>\""
+}
+
+cmd_use() {
+    local alvo="$1"
+    carregar_env
+    garantir_token
+
+    # "today"/"hoje" nao e uma lista real, e uma smart view: tarefas de
+    # todas as listas com vencimento hoje (ou atrasadas).
+    if [[ "${alvo,,}" == "today" || "${alvo,,}" == "hoje" ]]; then
+        PROJECT_ID="__today__"
+        PROJECT_NAME="Hoje (Today)"
+        salvar_env
+        info "Selecionado: $PROJECT_NAME - tarefas vencidas/para hoje de todas as listas (+ Inbox)"
+        return 0
+    fi
+
+    local resp match
+    resp=$(api_get "/project")
+    # casa por id exato OU por nome (case-insensitive)
+    match=$(jq -r --arg a "$alvo" '
+        [ .[] | select((.id==$a) or (.name|ascii_downcase == ($a|ascii_downcase))) ][0]
+        // empty' <<<"$resp")
+    if [[ -z "$match" ]]; then
+        erro "Nenhuma lista com nome/id '$alvo'. Veja: tarefas-fetch lists"
+        exit 1
+    fi
+    PROJECT_ID=$(jq -r '.id' <<<"$match")
+    PROJECT_NAME=$(jq -r '.name' <<<"$match")
+    salvar_env
+    info "Lista selecionada: $PROJECT_NAME [$PROJECT_ID]"
+}
+
+# Replica a smart view "Today": tarefas ativas de TODAS as listas cujo
+# vencimento e hoje ou anterior (atrasadas). Imprime titulos, um por linha.
+coletar_hoje() {
+    local hoje projetos all_tasks pid data tasks
+    hoje=$(date +%F)
+    projetos=$(api_get "/project")
+    all_tasks="[]"
+    # "inbox" e um id especial: a Inbox nao aparece em /project mas
+    # /project/inbox/data funciona. Varremos ela + todas as listas.
+    while IFS= read -r pid; do
+        [[ -n "$pid" ]] || continue
+        data=$(api_get "/project/${pid}/data")
+        tasks=$(jq -c '.tasks // []' <<<"$data" 2>/dev/null || echo '[]')
+        all_tasks=$(jq -cn --argjson a "$all_tasks" --argjson b "$tasks" '$a + $b')
+    done < <( { echo "inbox"; jq -r '.[].id' <<<"$projetos"; } )
+
+    jq -r --arg today "$hoje" --argjson max "$MAX_TAREFAS" --argjson tam "$TAM_TAREFA" '
+        map(select(.status == 0 and .dueDate != null))
+        | map(select((.dueDate[0:10]) <= $today))
+        | sort_by([ (.dueDate[0:10]), -(.priority // 0) ])
+        | .[0:$max]
+        | .[].title[0:$tam] | sub("[[:space:]]+$"; "")
+    ' <<<"$all_tasks"
+}
+
+cmd_fetch() {
+    local para_stdout="$1"
+    carregar_env
+    garantir_token
+    if [[ -z "$PROJECT_ID" ]]; then
+        erro "Nenhuma lista escolhida. Rode: tarefas-fetch lists && tarefas-fetch use \"<nome>\""
+        exit 1
+    fi
+
+    info "Buscando tarefas de '$PROJECT_NAME'..."
+
+    if [[ "$PROJECT_ID" == "__today__" ]]; then
+        mapfile -t TAREFAS < <(coletar_hoje)
+    else
+        local resp
+        resp=$(api_get "/project/${PROJECT_ID}/data")
+        # status 0 = ativa, 2 = concluida. Ordena por prioridade desc, depois ordem manual.
+        mapfile -t TAREFAS < <(jq -r --argjson max "$MAX_TAREFAS" --argjson tam "$TAM_TAREFA" '
+            (.tasks // [])
+            | map(select(.status == 0))
+            | sort_by([ -(.priority // 0), (.sortOrder // 0) ])
+            | .[0:$max]
+            | .[].title[0:$tam] | sub("[[:space:]]+$"; "")
+        ' <<<"$resp")
+    fi
+
+    if [[ ${#TAREFAS[@]} -eq 0 ]]; then
+        aviso "Nenhuma tarefa ativa em '$PROJECT_NAME'."
+    fi
+
+    if [[ "$para_stdout" == "1" ]]; then
+        printf '%s\n' "${TAREFAS[@]}"
+        return 0
+    fi
+
+    {
+        echo "# Tarefas puxadas do TickTick / lista: $PROJECT_NAME"
+        echo "# $(date '+%Y-%m-%d %H:%M') - titulos ja truncados em ${TAM_TAREFA} chars; edite e salve para sincronizar"
+        echo
+        printf '%s\n' "${TAREFAS[@]}"
+    } > "$ARQUIVO"
+
+    info "${#TAREFAS[@]} tarefa(s) gravada(s) em $ARQUIVO"
+    info "Agora rode: tarefas-arduino"
+}
+
+# ---------------------------------------------------------------------------
+uso() {
+    sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+cmd="${1:-fetch}"
+case "$cmd" in
+    auth)   cmd_auth ;;
+    lists)  cmd_lists ;;
+    use)    [[ -n "${2:-}" ]] || { erro "Uso: tarefas-fetch use \"<nome|id>\""; exit 1; }
+            cmd_use "$2" ;;
+    --stdout) cmd_fetch 1 ;;
+    fetch)  cmd_fetch 0 ;;
+    -h|--help|help) uso ;;
+    *)      erro "Comando desconhecido: $cmd"; uso; exit 1 ;;
+esac

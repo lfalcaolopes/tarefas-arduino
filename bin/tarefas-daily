@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+
+# tarefas-daily - executado pelo systemd timer (6h): puxa as tarefas do
+# TickTick e sincroniza com o Arduino, sem interacao. Notifica em caso de falha.
+set -uo pipefail
+
+export PATH="$HOME/.local/bin:$PATH"
+
+LOG="$HOME/.config/tarefas-arduino/daily.log"
+FETCH="$HOME/.local/bin/tarefas-fetch"
+SYNC="$HOME/.local/bin/tarefas-arduino"
+
+notificar() {
+    command -v notify-send >/dev/null 2>&1 && \
+        notify-send -u critical "tarefas-arduino" "$1" || true
+}
+
+{
+    echo "===== $(date '+%F %T') ====="
+
+    if ! "$FETCH"; then
+        echo "FALHA: tarefas-fetch"
+        notificar "Falha ao buscar do TickTick (token expirado? rode: tarefas-fetch auth)"
+        exit 1
+    fi
+
+    if ! "$SYNC" --no-editor; then
+        echo "FALHA: tarefas-arduino"
+        notificar "Falha ao sincronizar com o Arduino (conectado em /dev/ttyUSB0?)"
+        exit 1
+    fi
+
+    echo "OK"
+} >> "$LOG" 2>&1

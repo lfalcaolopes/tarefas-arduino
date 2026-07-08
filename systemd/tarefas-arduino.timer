@@ -1,0 +1,10 @@
+[Unit]
+Description=Dispara a sincronizacao tarefas->Arduino todo dia as 6h
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

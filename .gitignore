@@ -1,0 +1,15 @@
+# Segredos e dados pessoais - NUNCA commitar.
+# (Ficam em ~/.config/tarefas-arduino/, fora deste repo, mas listados por seguranca.)
+ticktick.env
+ticktick-token.json
+tarefas.txt
+daily.log
+
+# Artefatos de build do Arduino
+*.hex
+*.elf
+build/
+
+# Diversos
+*.log
+.DS_Store

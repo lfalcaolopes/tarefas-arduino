@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+
+# tarefas - sincroniza lista de tarefas com Arduino via serial
+set -euo pipefail
+
+PORTA="${TAREFAS_PORTA:-/dev/ttyUSB0}"
+BAUD=9600
+ARQUIVO="$HOME/.config/tarefas-arduino/tarefas.txt"
+EDITOR_CMD="${EDITOR:-nvim}"
+MAX_TAREFAS=10
+TAM_TAREFA=16
+TIMEOUT_RESPOSTA=3  # segundos pra esperar resposta do Arduino
+
+VERDE='\033[0;32m'
+AMARELO='\033[0;33m'
+VERMELHO='\033[0;31m'
+RESET='\033[0m'
+
+info()   { echo -e "${VERDE}→${RESET} $*"; }
+aviso()  { echo -e "${AMARELO}!${RESET} $*"; }
+erro()   { echo -e "${VERMELHO}✗${RESET} $*" >&2; }
+
+# --no-editor: sincroniza o arquivo atual sem abrir o editor
+# (util para automacao, ex: `tarefas-fetch && tarefas-arduino --no-editor`)
+NO_EDITOR=0
+for arg in "$@"; do
+    case "$arg" in
+        --no-editor) NO_EDITOR=1 ;;
+        -h|--help)   echo "Uso: tarefas-arduino [--no-editor]"; exit 0 ;;
+        *)           erro "Argumento desconhecido: $arg"; exit 1 ;;
+    esac
+done
+
+if [[ ! -e "$PORTA" ]]; then
+    erro "Arduino não encontrado em $PORTA"
+    erro "Conecta o cabo USB ou define a variável TAREFAS_PORTA"
+    exit 1
+fi
+
+if [[ ! -f "$ARQUIVO" ]]; then
+    cat > "$ARQUIVO" <<'EOF'
+# Lista de tarefas - uma por linha
+# Linhas começando com # são ignoradas
+# Máximo: 10 tarefas, 16 caracteres cada
+
+EOF
+fi
+
+if [[ $NO_EDITOR -eq 1 ]]; then
+    info "Modo --no-editor: sincronizando o arquivo atual sem abrir editor."
+else
+    HASH_ANTES=$(md5sum "$ARQUIVO" | cut -d' ' -f1)
+    "$EDITOR_CMD" "$ARQUIVO"
+    HASH_DEPOIS=$(md5sum "$ARQUIVO" | cut -d' ' -f1)
+
+    if [[ "$HASH_ANTES" == "$HASH_DEPOIS" ]]; then
+        aviso "Arquivo não foi modificado. Nada enviado ao Arduino."
+        exit 0
+    fi
+fi
+
+mapfile -t TAREFAS < <(grep -v '^\s*#' "$ARQUIVO" | grep -v '^\s*$' | sed 's/[[:space:]]\+$//')
+NUM_TAREFAS=${#TAREFAS[@]}
+
+if [[ $NUM_TAREFAS -gt $MAX_TAREFAS ]]; then
+    erro "Você tem $NUM_TAREFAS tarefas, máximo é $MAX_TAREFAS"
+    exit 1
+fi
+
+LINHAS_LONGAS=()
+for i in "${!TAREFAS[@]}"; do
+    if [[ ${#TAREFAS[$i]} -gt $TAM_TAREFA ]]; then
+        LINHAS_LONGAS+=("$((i+1)): ${TAREFAS[$i]}")
+    fi
+done
+
+if [[ ${#LINHAS_LONGAS[@]} -gt 0 ]]; then
+    aviso "As seguintes tarefas têm mais de $TAM_TAREFA caracteres e serão truncadas:"
+    for linha in "${LINHAS_LONGAS[@]}"; do
+        echo "    $linha"
+    done
+    read -rp "Continuar? [s/N] " resposta
+    [[ "$resposta" =~ ^[Ss]$ ]] || { aviso "Cancelado."; exit 0; }
+fi
+
+if [[ $NUM_TAREFAS -eq 0 ]]; then
+    aviso "Arquivo vazio. Isso vai apagar TODAS as tarefas do Arduino."
+    read -rp "Confirma? [s/N] " resposta
+    [[ "$resposta" =~ ^[Ss]$ ]] || { aviso "Cancelado."; exit 0; }
+fi
+
+info "Conectando em $PORTA..."
+stty -F "$PORTA" $BAUD cs8 -cstopb -parenb -ixon -ixoff -crtscts raw -echo
+
+exec 3<>"$PORTA"
+
+# Espera o Arduino resetar (acontece quando abre a serial)
+sleep 2
+
+# Drena qualquer dado pendente no buffer
+while IFS= read -r -t 0.1 -u 3 _ 2>/dev/null; do :; done
+
+# Envia comando e espera por uma linha de resposta que contenha o padrão esperado
+enviar_e_esperar() {
+    local cmd="$1"
+    local padrao="$2"
+
+    printf '%s\n' "$cmd" >&3
+
+    local linha
+    local inicio=$SECONDS
+    while (( SECONDS - inicio < TIMEOUT_RESPOSTA )); do
+        if IFS= read -r -t 0.5 -u 3 linha 2>/dev/null; then
+            # Remove \r do final (Arduino envia CRLF)
+            linha="${linha%$'\r'}"
+            if [[ "$linha" == *"$padrao"* ]]; then
+                return 0
+            fi
+        fi
+    done
+
+    erro "Timeout esperando resposta para: $cmd"
+    return 1
+}
+
+# Limpa tudo
+info "Limpando tarefas anteriores..."
+enviar_e_esperar "CLEAR" "apagadas" || { exec 3<&-; exec 3>&-; exit 1; }
+
+# Envia cada tarefa
+for tarefa in "${TAREFAS[@]}"; do
+    info "Adicionando: $tarefa"
+    if ! enviar_e_esperar "ADD: $tarefa" "Adicionada"; then
+        exec 3<&-
+        exec 3>&-
+        exit 1
+    fi
+done
+
+exec 3<&-
+exec 3>&-
+
+echo
+if [[ $NUM_TAREFAS -eq 0 ]]; then
+    info "Arduino limpo. Nenhuma tarefa cadastrada."
+else
+    info "$NUM_TAREFAS tarefa(s) sincronizada(s) com sucesso."
+fi
