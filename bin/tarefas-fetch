@@ -255,7 +255,7 @@ coletar_hoje() {
     jq -r --arg today "$hoje" --argjson max "$MAX_TAREFAS" --argjson tam "$TAM_TAREFA" '
         map(select(.status == 0 and .dueDate != null))
         | map(select((.dueDate[0:10]) <= $today))
-        | sort_by([ (.dueDate[0:10]), -(.priority // 0) ])
+        | sort_by([ -(.priority // 0), (.dueDate[0:10])  ])
         | .[0:$max]
         | .[].title[0:$tam] | sub("[[:space:]]+$"; "")
     ' <<<"$all_tasks"
